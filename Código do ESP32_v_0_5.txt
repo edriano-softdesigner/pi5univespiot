@@ -1,0 +1,200 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// Config Wi-Fi
+const char* ssid = "";
+const char* password = ""; // mantenha vazio ou substitua pela senha correta
+
+// Config HTTP
+const char* serverUrl   = "https://";
+const char* controleUrl = "https://";
+
+// API de geolocalização gratuita (ip-api.com)
+const char* geoUrl = "http://ip-api.com/json";
+
+// API de clima (OpenWeatherMap)
+String apiKey = ""; // substitua pela sua chave gratuita
+String weatherUrl = "";
+
+// Pinos sensores
+#define UMIDADE1 34
+#define UMIDADE2 35
+#define UMIDADE3 32
+#define BOMBA 25
+#define IRRIGACAO 26
+
+// Calibração dos sensores
+const int secoRef1  = 2550;
+const int umidoRef1 = 1200;
+const int secoRef2  = 2545;
+const int umidoRef2 = 1200;
+const int secoRef3  = 2554;
+const int umidoRef3 = 1200;
+
+// Função para converter leitura bruta em porcentagem
+int mapUmidade(int valor, int secoRef, int umidoRef) {
+  return constrain(map(valor, secoRef, umidoRef, 0, 100), 0, 100);
+}
+
+// Função para calcular média móvel
+int mediaUmidade(int pino, int secoRef, int umidoRef, int amostras = 10) {
+  long soma = 0;
+  for (int i = 0; i < amostras; i++) {
+    soma += analogRead(pino);
+    delay(20);
+  }
+  int mediaRaw = soma / amostras;
+  Serial.printf("Leitura bruta pino %d: %d\n", pino, mediaRaw);
+  return mapUmidade(mediaRaw, secoRef, umidoRef);
+}
+
+// Configuração NTP
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = -3 * 3600; // Brasil GMT-3
+const int daylightOffset_sec = 0;
+
+void obterHora(int &hora, int &minuto) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("⚠️ Falha ao obter hora NTP");
+    hora = -1;
+    minuto = -1;
+    return;
+  }
+  hora = timeinfo.tm_hour;
+  minuto = timeinfo.tm_min;
+}
+
+// Função para obter localização via IP
+void obterLocalizacao() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(geoUrl);
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      String payload = http.getString();
+      StaticJsonDocument<512> doc;
+      deserializeJson(doc, payload);
+      String lat = doc["lat"].as<String>();
+      String lon = doc["lon"].as<String>();
+      Serial.printf("📍 Localização aproximada: Lat %s | Lon %s\n", lat.c_str(), lon.c_str());
+      weatherUrl = "http://api.openweathermap.org/data/2.5/weather?lat=" + lat + "&lon=" + lon + "&appid=" + apiKey + "&units=metric";
+    }
+    http.end();
+  }
+}
+
+// Função para obter clima atual
+void obterClima(float &temperatura, float &umidade_ar) {
+  temperatura = -999;
+  umidade_ar = -999;
+  if (WiFi.status() == WL_CONNECTED && weatherUrl != "") {
+    HTTPClient http;
+    http.begin(weatherUrl);
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      String payload = http.getString();
+      StaticJsonDocument<1024> doc;
+      deserializeJson(doc, payload);
+      temperatura = doc["main"]["temp"];
+      umidade_ar  = doc["main"]["humidity"];
+      Serial.printf("🌡️ Temp API: %.2f °C | 💧 Umidade API: %.2f %%\n", temperatura, umidade_ar);
+    }
+    http.end();
+  }
+}
+
+// Função para verificar se está dentro de um dos períodos de irrigação
+bool periodoIrrigacao(int hora, int minuto) {
+  // períodos: 07:00, 15:00, 23:00
+  int horarios[] = {7, 15, 23};
+  for (int i = 0; i < 3; i++) {
+    if (hora == horarios[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BOMBA, OUTPUT);
+  pinMode(IRRIGACAO, OUTPUT);
+
+  WiFi.begin(ssid, password);
+  Serial.println("Conectando ao Wi-Fi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ Wi-Fi conectado!");
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  analogReadResolution(12);
+
+  // Obter localização aproximada via IP
+  obterLocalizacao();
+}
+
+void loop() {
+  int hora, minuto;
+  obterHora(hora, minuto);
+  Serial.printf("\n🕒 Hora atual: %02d:%02d\n", hora, minuto);
+
+  // Ler sensores
+  int u1 = mediaUmidade(UMIDADE1, secoRef1, umidoRef1);
+  int u2 = mediaUmidade(UMIDADE2, secoRef2, umidoRef2);
+  int u3 = mediaUmidade(UMIDADE3, secoRef3, umidoRef3);
+
+  // Obter clima externo
+  float temperatura, umidade_ar;
+  obterClima(temperatura, umidade_ar);
+
+  int irrigacao = 0;
+  int bomba = 0;
+
+  // Lógica de irrigação e bomba
+  if (periodoIrrigacao(hora, minuto)) {
+    if (minuto < 30) {
+      // Primeiros 30 minutos → irrigação ligada
+      irrigacao = 1;
+      bomba = 0;
+      digitalWrite(IRRIGACAO, HIGH);
+      digitalWrite(BOMBA, LOW);
+    } else {
+      // Próximos 30 minutos → bomba ligada
+      irrigacao = 0;
+      bomba = 1;
+      digitalWrite(IRRIGACAO, LOW);
+      digitalWrite(BOMBA, HIGH);
+    }
+  } else {
+    irrigacao = 0;
+    bomba = 0;
+    digitalWrite(IRRIGACAO, LOW);
+    digitalWrite(BOMBA, LOW);
+  }
+
+  // Enviar dados via HTTP
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+    String json = "{\"umidade1\":" + String(u1) +
+                  ",\"umidade2\":" + String(u2) +
+                  ",\"umidade3\":" + String(u3) +
+                  ",\"bomba\":" + String(bomba) +
+                  ",\"irrigacao\":" + String(irrigacao) +
+                  ",\"temperatura\":" + String(temperatura, 2) +
+                  ",\"umidade_ar\":" + String(umidade_ar, 2) + "}";
+    int httpResponseCode = http.POST(json);
+    Serial.printf("🌐 HTTP POST enviado → Código resposta: %d\n", httpResponseCode);
+    Serial.println("Payload enviado: " + json);
+    http.end();
+  }
+
+  Serial.println("===== FIM DO CICLO =====\n");
+  delay(60000); // ciclo a cada 1 minuto
+}
